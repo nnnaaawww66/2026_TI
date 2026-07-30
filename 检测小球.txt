@@ -1,0 +1,182 @@
+"""
+实验名称：在线训练-YOLO图像检测: 基于摄像头
+实验平台：01Studio CanMV K230/CanMV K230 mini
+说明：可以通过display="xxx"参数选择"hdmi"、"lcd3_5"(3.5寸mipi屏)或"lcd2_4"(2.4寸mipi屏)显示方式
+01科技（01Studio）在线训练平台：https://ai.01studio.cc
+修改：串口发送整数字符串（不带小数点），移除终端打印，保持屏幕显示
+"""
+
+from libs.PipeLine import PipeLine
+from libs.YOLO import YOLO11
+from libs.Utils import *
+from media.sensor import *
+import os, sys, gc
+import ulab.numpy as np
+import image
+import time
+
+# 导入串口库
+from ybUtils.YbUart import YbUart
+
+# ===== 配置参数 =====
+kmodel_path = "/sdcard/yolo11n_det_320.kmodel"
+labels = {0: ''}          # 标签置空
+model_input_size = [320, 320]
+display = "lcd2_4"   # 根据屏幕修改：hdmi / lcd3_5 / lcd2_4
+
+if display == "hdmi":
+    display_mode = "hdmi"
+    display_size = [1920, 1080]
+elif display == "lcd3_5":
+    display_mode = "st7701"
+    display_size = [800, 480]
+elif display == "lcd2_4":
+    display_mode = "st7701"
+    display_size = [640, 480]
+
+rgb888p_size = [640, 320]   # YOLO 输入尺寸
+
+# ===== 初始化 PipeLine =====
+pl = PipeLine(
+    rgb888p_size=rgb888p_size, display_size=display_size, display_mode=display_mode
+)
+
+if display == "lcd2_4":
+    pl.create(sensor=Sensor(id=2, width=1280, height=960))  # 摄像头csi2, 4:3
+else:
+    pl.create(sensor=Sensor(id=2, width=1920, height=1080))
+
+display_size = pl.get_display_size()
+
+# ===== 初始化 YOLO =====
+confidence_threshold = 0.6
+nms_threshold = 0.45
+yolo = YOLO11(
+    task_type="detect",
+    mode="video",
+    kmodel_path=kmodel_path,
+    labels=labels,
+    rgb888p_size=rgb888p_size,
+    model_input_size=model_input_size,
+    display_size=display_size,
+    conf_thresh=confidence_threshold,
+    nms_thresh=nms_threshold,
+    max_boxes_num=50,
+    debug_mode=0,
+)
+yolo.config_preprocess()
+
+# ===== 初始化串口 =====
+uart = YbUart(baudrate=115200)   # 高速发送
+
+clock = time.clock()
+
+# ===== 画面中心坐标 =====
+center_x_display = display_size[0] // 2
+center_y_display = display_size[1] // 2
+
+# ===== 丢球机制变量 =====
+last_offset = 0.0
+lost_counter = 0
+drift_rate = 0.5
+
+# 调试标志
+debug_printed = False
+
+try:
+    while True:
+        clock.tick()
+
+        # 获取图像并推理
+        img = pl.get_frame()
+        res = yolo.run(img)
+        yolo.draw_result(res, pl.osd_img)
+
+        if not debug_printed and res and len(res) > 0:
+            debug_printed = True
+
+        # ---- 绘制参考线 ----
+        pl.osd_img.draw_line(center_x_display, 0, center_x_display, display_size[1], color=(0, 255, 0), thickness=2)
+        pl.osd_img.draw_line(0, center_y_display, display_size[0], center_y_display, color=(200, 200, 200), thickness=1)
+
+        ball_detected = False
+        offset = last_offset
+
+        if res and len(res) > 0:
+            box_data = res[0]
+            if box_data and len(box_data) > 0:
+                arr = box_data[0]
+                try:
+                    x1 = int(arr[0])
+                    y1 = int(arr[1])
+                    w = int(arr[2])
+                    h = int(arr[3])
+                    ball_detected = True
+                    ball_cx = x1 + w // 2
+                    ball_cy = y1 + h // 2
+                    offset = ball_cx - center_x_display
+                    last_offset = offset
+                    lost_counter = 0
+
+                    # 蓝色水平连线
+                    pl.osd_img.draw_line(ball_cx, ball_cy, center_x_display, ball_cy, color=(0, 0, 255), thickness=3)
+                    pl.osd_img.draw_circle(ball_cx, ball_cy, 5, color=(0, 255, 255), thickness=2)
+
+                except Exception:
+                    ball_detected = False
+
+        if not ball_detected:
+            lost_counter += 1
+            if last_offset >= 0:
+                offset = last_offset + lost_counter * drift_rate
+            else:
+                offset = last_offset - lost_counter * drift_rate
+            pl.osd_img.draw_string(10, 20, "Ball Lost!", color=(255, 0, 0), scale=2)
+
+        # ---- 屏幕显示偏移量（保留小数，便于观察） ----
+        if offset < 0:
+            text_color = (255, 0, 0)
+        else:
+            text_color = (0, 255, 0)
+        text = "{:.1f}px".format(offset)   # 屏幕显示仍保留小数
+
+        if ball_detected:
+            mid_x = (ball_cx + center_x_display) // 2
+            text_y = ball_cy + 15
+            last_mid_x = mid_x
+            last_text_y = text_y
+        else:
+            if 'last_mid_x' not in locals():
+                last_mid_x = center_x_display
+                last_text_y = center_y_display
+            mid_x = last_mid_x
+            text_y = last_text_y
+
+        try:
+            pl.osd_img.draw_string_advanced(mid_x - 60, text_y, text, color=text_color, font_size=32)
+        except Exception:
+            char_width = 30
+            text_width = len(text) * char_width
+            text_x = mid_x - text_width // 2
+            if text_x < 5:
+                text_x = 5
+            if text_x + text_width > display_size[0]:
+                text_x = display_size[0] - text_width - 5
+            if text_y < 5:
+                text_y = 5
+            if text_y + 40 > display_size[1]:
+                text_y = display_size[1] - 45
+            pl.osd_img.draw_string(text_x, text_y, text, color=text_color, scale=4)
+
+        # ---- 串口发送：整数字符串（四舍五入取整，带正负号，无单位） ----
+        int_offset = int(offset + 0.5 if offset >= 0 else offset - 0.5)  # 四舍五入
+        uart.send(str(int_offset) + "\n")
+
+        # ---- 显示 ----
+        pl.show_image()
+        gc.collect()
+
+finally:
+    yolo.deinit()
+    pl.destroy()
+    uart.deinit()
