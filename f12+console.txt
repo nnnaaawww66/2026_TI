@@ -1,0 +1,21 @@
+(function(){
+if(document.getElementById('mc-tool'))return;
+var s=document.createElement('style');
+s.textContent='#mc-tool{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);z-index:99999;background:rgba(10,14,23,0.92);backdrop-filter:blur(16px);padding:16px 28px;border-radius:60px;display:flex;align-items:center;gap:16px;border:1px solid rgba(0,210,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.8);font-family:Arial,sans-serif;flex-wrap:wrap;justify-content:center}#mc-tool .b{padding:10px 28px;border:none;border-radius:40px;font-size:15px;font-weight:600;cursor:pointer;transition:all .25s;color:#fff}#mc-tool .b:hover{transform:translateY(-2px)}#mc-tool .rec{background:linear-gradient(135deg,#ff416c,#ff4b2b)}#mc-tool .rec.on{background:linear-gradient(135deg,#f7971e,#ffd200);animation:mcG 1s infinite alternate}#mc-tool .stop{background:linear-gradient(135deg,#00b894,#00cec9)}#mc-tool .t{font-family:monospace;font-size:22px;font-weight:700;color:#ff6b6b;min-width:70px;text-align:center}#mc-tool .t.idle{color:#556677}#mc-tool .s{color:#8899aa;font-size:13px}#mc-tool .d{display:inline-block;width:10px;height:10px;border-radius:50%;background:#4caf50;margin-right:8px;animation:mcP 1.8s infinite}#mc-tool .d.off{background:#f44336;animation:none}#mc-tool .x{background:0 0;border:none;color:#445566;font-size:20px;cursor:pointer;padding:0 4px}#mc-tool .x:hover{color:#ff416c}@keyframes mcP{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.85)}}@keyframes mcG{0%{box-shadow:0 0 10px rgba(255,210,0,0.2)}100%{box-shadow:0 0 30px rgba(255,210,0,0.5)}}';
+document.head.appendChild(s);
+var u=document.createElement('div');
+u.id='mc-tool';
+u.innerHTML='<span class="d" id="mcd"></span><span class="s" id="mcs">就绪</span><button class="b rec" id="mcr">● 录制</button><button class="b stop" id="mcsb" style="display:none;">■ 停止</button><span class="t idle" id="mct">00:00</span><button class="x" id="mcx">✕</button>';
+document.body.appendChild(u);
+var r=null,c=[],rec=!1,st=0,ti=null,v=document.querySelector('video'),dot=document.getElementById('mcd'),stEl=document.getElementById('mcs'),rb=document.getElementById('mcr'),sb=document.getElementById('mcsb'),tm=document.getElementById('mct');
+function setS(t,o){stEl.textContent=t;dot.className='d'+(o===false?' off':'')}
+function fmt(ms){var s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60),p=function(n){return String(n).padStart(2,'0')};return h>0?p(h)+':'+p(m%60)+':'+p(s%60):p(m)+':'+p(s%60)}
+function getS(){return v&&v.srcObject?v.srcObject:null}
+function startR(){var s=getS();if(!s){setS('等待视频...',false);return}try{var mt='video/webm';['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].forEach(function(t){if(MediaRecorder.isTypeSupported(t))mt=t});r=new MediaRecorder(s,{mimeType:mt,videoBitsPerSecond:4000000});c=[];r.ondataavailable=function(e){if(e.data&&e.data.size>0)c.push(e.data)};r.onstop=function(){var b=new Blob(c,{type:mt}),d=new Date(),ts=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+'_'+String(d.getHours()).padStart(2,'0')+String(d.getMinutes()).padStart(2,'0')+String(d.getSeconds()).padStart(2,'0'),fn='maixcam_'+ts+'.webm';var url=URL.createObjectURL(b),a=document.createElement('a');a.href=url;a.download=fn;document.body.appendChild(a);a.click();document.body.removeChild(a);setTimeout(function(){URL.revokeObjectURL(url)},30000);setS('已保存',true);rec=false;clearInterval(ti);tm.textContent='00:00';tm.className='t idle';rb.style.display='inline-block';sb.style.display='none';rb.textContent='● 录制';rb.className='b rec'};r.start(1000);rec=true;st=Date.now();setS('录制中...',true);rb.style.display='none';sb.style.display='inline-block';tm.className='t';ti=setInterval(function(){tm.textContent=fmt(Date.now()-st)},500)}catch(e){setS('错误',false)}}
+function stopR(){if(r&&r.state==='recording'){setS('保存中...',true);r.stop()}}
+rb.onclick=startR;
+sb.onclick=stopR;
+document.addEventListener('keydown',function(e){if(e.key==='r'||e.key==='R'){if(rec)stopR();else startR()}});
+document.getElementById('mcx').onclick=function(){if(rec&&!confirm('正在录制，确定关闭？'))return;try{if(r)r.stop()}catch(e){}u.remove();s.remove()};
+if(v&&v.srcObject){setS('就绪',true)}else{setS('等待视频...',false);var ch=setInterval(function(){if(v&&v.srcObject){setS('就绪',true);clearInterval(ch)}},1000)};
+})();
