@@ -1,0 +1,356 @@
+"""
+实验名称：在线训练-YOLO图像检测: 基于摄像头
+实验平台：01Studio CanMV K230/CanMV K230 mini
+说明：可以通过display="xxx"参数选择"hdmi"、"lcd3_5"(3.5寸mipi屏)或"lcd2_4"(2.4寸mipi屏)显示方式
+01科技（01Studio）在线训练平台：https://ai.01studio.cc
+修改：串口发送整数字符串（不带小数点），移除终端打印，保持屏幕显示
+新增：触摸控制中心点位置功能（基于 machine.TOUCH）
+"""
+
+from libs.PipeLine import PipeLine
+from libs.YOLO import YOLO11
+from libs.Utils import *
+from media.sensor import *
+from media.display import *
+from media.media import *
+from machine import TOUCH
+import os, sys, gc
+import ulab.numpy as np
+import image
+import time
+
+# 导入串口库
+from ybUtils.YbUart import YbUart
+
+# ===== 配置参数 =====
+kmodel_path = "/sdcard/yolo11n_det_320.kmodel"
+labels = {0: ''}          # 标签置空
+model_input_size = [320, 320]
+display = "lcd2_4"   # 根据屏幕修改：hdmi / lcd3_5 / lcd2_4
+
+if display == "hdmi":
+    display_mode = "hdmi"
+    display_size = [1920, 1080]
+elif display == "lcd3_5":
+    display_mode = "st7701"
+    display_size = [800, 480]
+elif display == "lcd2_4":
+    display_mode = "st7701"
+    display_size = [640, 480]
+
+rgb888p_size = [640, 320]   # YOLO 输入尺寸
+
+# ===== 初始化 PipeLine =====
+pl = PipeLine(
+    rgb888p_size=rgb888p_size, display_size=display_size, display_mode=display_mode
+)
+
+if display == "lcd2_4":
+    pl.create(sensor=Sensor(id=2, width=1280, height=960))  # 摄像头csi2, 4:3
+else:
+    pl.create(sensor=Sensor(id=2, width=1920, height=1080))
+
+display_size = pl.get_display_size()
+
+# ===== 初始化 YOLO =====
+confidence_threshold = 0.6
+nms_threshold = 0.45
+yolo = YOLO11(
+    task_type="detect",
+    mode="video",
+    kmodel_path=kmodel_path,
+    labels=labels,
+    rgb888p_size=rgb888p_size,
+    model_input_size=model_input_size,
+    display_size=display_size,
+    conf_thresh=confidence_threshold,
+    nms_thresh=nms_threshold,
+    max_boxes_num=50,
+    debug_mode=0,
+)
+yolo.config_preprocess()
+
+# ===== 初始化串口 =====
+uart = YbUart(baudrate=115200)
+
+# ===== 初始化触摸 =====
+tp = TOUCH(0)  # 初始化触摸传感器
+
+clock = time.clock()
+
+# ===== 触摸控制变量 =====
+center_x_display = display_size[0] // 2  # 默认中心X
+center_y_display = display_size[1] // 2  # 默认中心Y
+touch_mode = False  # False: 固定模式, True: 可调节模式
+touch_confirmed = True  # True: 已确认, False: 未确认
+temp_center_x = center_x_display  # 临时中心点X
+
+# ===== 丢球机制变量 =====
+last_offset = 0.0
+lost_counter = 0
+drift_rate = 0.5
+
+debug_printed = False
+
+# 触摸状态
+is_touching = False
+last_touch_state = False
+
+# ===== 按键区域（左上角，更大） =====
+button_x = 20
+button_y = 20
+button_w = 140
+button_h = 60
+
+def draw_transparent_rect(img, x, y, w, h, color, alpha=128):
+    """
+    绘制半透明矩形
+    alpha: 0-255, 128表示50%透明度
+    """
+    # 先绘制一个半透明的填充矩形
+    # 由于CanMV的draw_rectangle不支持透明度参数，我们通过绘制多个点来实现半透明效果
+    # 或者使用draw_rectangle的fill=True并配合color的alpha值
+    try:
+        # 尝试使用带透明度的绘制
+        img.draw_rectangle(x, y, w, h, color=color, thickness=2, fill=True, alpha=alpha)
+    except:
+        # 如果不支持alpha，则使用普通绘制，然后叠加一个半透明效果
+        # 方法：绘制一个实心矩形，然后绘制一个半透明的覆盖层
+        img.draw_rectangle(x, y, w, h, color=color, thickness=2, fill=True)
+        # 绘制白色半透明覆盖层模拟透明度
+        # 这里使用交叉线或点阵模拟半透明效果
+        for i in range(x, x + w, 4):
+            for j in range(y, y + h, 4):
+                if (i + j) % 8 < 4:  # 棋盘格效果
+                    img.draw_pixel(i, j, color=(255, 255, 255, 128))
+
+try:
+    while True:
+        clock.tick()
+
+        # 获取图像并推理
+        img = pl.get_frame()
+        res = yolo.run(img)
+        yolo.draw_result(res, pl.osd_img)
+
+        if not debug_printed and res and len(res) > 0:
+            debug_printed = True
+
+        # ---- 获取触摸事件 ----
+        points = tp.read(1)  # 读取触摸数据，每次最多读取1个点
+
+        if len(points) > 0:
+            pt = points[0]
+            touch_x = pt.x
+            touch_y = pt.y
+            touch_event = pt.event
+
+            # 检测触摸按下事件 (TOUCH.EVENT_DOWN)
+            if touch_event == TOUCH.EVENT_DOWN:
+                # 检查是否点击到按键区域（左上角）
+                if button_x <= touch_x <= button_x + button_w and button_y <= touch_y <= button_y + button_h:
+                    if not touch_mode:
+                        # 进入触摸调节模式
+                        touch_mode = True
+                        touch_confirmed = False
+                        temp_center_x = center_x_display
+                        print("Enter adjustment mode")
+                    else:
+                        if not touch_confirmed:
+                            # 确认当前临时中心点
+                            center_x_display = temp_center_x
+                            touch_confirmed = True
+                            touch_mode = False
+                            print("Center locked at X:", center_x_display)
+                        else:
+                            # 如果已经确认，再次点击则进入调节模式
+                            touch_mode = True
+                            touch_confirmed = False
+                            temp_center_x = center_x_display
+                            print("Enter adjustment mode")
+
+                # 如果在触摸调节模式且未确认，点击其他位置更新临时中心点
+                elif touch_mode and not touch_confirmed:
+                    # 检查是否点击在中心线附近（防止误触）
+                    if abs(touch_x - temp_center_x) > 20:
+                        temp_center_x = touch_x
+                        print("Temp center set to X:", temp_center_x)
+
+            # 触摸移动事件 - 在调节模式下可以拖动调整
+            elif touch_event == TOUCH.EVENT_MOVE and touch_mode and not touch_confirmed:
+                # 检查是否在画布区域（非按钮区域）
+                if not (button_x <= touch_x <= button_x + button_w and button_y <= touch_y <= button_y + button_h):
+                    if abs(touch_x - temp_center_x) > 5:  # 微小移动也更新
+                        temp_center_x = touch_x
+
+        # ---- 绘制中心线 ----
+        current_center_x = temp_center_x if (touch_mode and not touch_confirmed) else center_x_display
+
+        # 根据状态选择颜色
+        if touch_mode and not touch_confirmed:
+            # 未确认状态：黄色虚线
+            center_line_color = (255, 255, 0)
+            line_thickness = 2
+            # 绘制虚线效果
+            for y in range(0, display_size[1], 20):
+                pl.osd_img.draw_line(current_center_x, y, current_center_x, min(y+10, display_size[1]),
+                                    color=center_line_color, thickness=line_thickness)
+        else:
+            # 已确认/固定模式：绿色实线
+            center_line_color = (0, 255, 0)
+            line_thickness = 2
+            pl.osd_img.draw_line(current_center_x, 0, current_center_x, display_size[1],
+                                color=center_line_color, thickness=line_thickness)
+
+        # 绘制水平参考线（灰色）
+        pl.osd_img.draw_line(0, center_y_display, display_size[0], center_y_display,
+                            color=(200, 200, 200), thickness=1)
+
+        # ---- 绘制按键（左上角，50%透明度） ----
+        if touch_mode and not touch_confirmed:
+            button_color = (200, 100, 0)  # 橙色 - 调节模式
+            button_text = "SET"
+        else:
+            button_color = (0, 100, 200)  # 蓝色 - 锁定模式
+            button_text = "LOCK"
+
+        # 绘制半透明按钮背景
+        try:
+            # 方法1: 使用alpha参数（如果支持）
+            pl.osd_img.draw_rectangle(button_x, button_y, button_w, button_h,
+                                     color=button_color, thickness=2, fill=True, alpha=128)
+        except:
+            # 方法2: 绘制实心矩形，然后绘制半透明覆盖层
+            pl.osd_img.draw_rectangle(button_x, button_y, button_w, button_h,
+                                     color=button_color, thickness=2, fill=True)
+            # 添加半透明效果：绘制带透明度的白色覆盖层（通过点阵模拟）
+            for i in range(button_x + 2, button_x + button_w - 2, 3):
+                for j in range(button_y + 2, button_y + button_h - 2, 3):
+                    if (i + j) % 6 < 3:  # 约50%的点覆盖
+                        pl.osd_img.draw_pixel(i, j, color=(255, 255, 255))
+
+        # 绘制按钮边框（加粗）
+        pl.osd_img.draw_rectangle(button_x, button_y, button_w, button_h,
+                                 color=(255, 255, 255), thickness=3)
+
+        # 绘制按钮文字
+        try:
+            # 计算文字居中位置
+            text_width = len(button_text) * 20  # 估算文字宽度
+            text_x = button_x + (button_w - text_width) // 2
+            text_y = button_y + 18
+            pl.osd_img.draw_string_advanced(text_x, text_y, button_text,
+                                           color=(255, 255, 255), font_size=28)
+        except:
+            pl.osd_img.draw_string(button_x + 20, button_y + 15, button_text,
+                                  color=(255, 255, 255), scale=3)
+
+        # ---- 显示当前状态 ----
+        if touch_mode and not touch_confirmed:
+            status_text = "Adjusting"
+            status_color = (255, 255, 0)
+        else:
+            status_text = "Locked"
+            status_color = (0, 255, 0)
+
+        # 在按钮下方显示状态文字
+        try:
+            pl.osd_img.draw_string_advanced(button_x, button_y + button_h + 10,
+                                           status_text, color=status_color, font_size=20)
+        except:
+            pl.osd_img.draw_string(button_x, button_y + button_h + 10,
+                                  status_text, color=status_color, scale=2)
+
+        # ---- 显示当前中心点坐标 ----
+        coord_text = "Center X:{:d}".format(current_center_x)
+        try:
+            pl.osd_img.draw_string_advanced(button_x, button_y + button_h + 40,
+                                           coord_text, color=(255, 255, 255), font_size=18)
+        except:
+            pl.osd_img.draw_string(button_x, button_y + button_h + 40,
+                                  coord_text, color=(255, 255, 255), scale=1)
+
+        # ---- 球检测和偏移计算 ----
+        ball_detected = False
+        offset = last_offset
+
+        if res and len(res) > 0:
+            box_data = res[0]
+            if box_data and len(box_data) > 0:
+                arr = box_data[0]
+                try:
+                    x1 = int(arr[0])
+                    y1 = int(arr[1])
+                    w = int(arr[2])
+                    h = int(arr[3])
+                    ball_detected = True
+                    ball_cx = x1 + w // 2
+                    ball_cy = y1 + h // 2
+                    offset = ball_cx - current_center_x
+                    last_offset = offset
+                    lost_counter = 0
+
+                    # 蓝色水平连线
+                    pl.osd_img.draw_line(ball_cx, ball_cy, current_center_x, ball_cy,
+                                        color=(0, 0, 255), thickness=3)
+                    pl.osd_img.draw_circle(ball_cx, ball_cy, 5, color=(0, 255, 255), thickness=2)
+
+                except Exception as e:
+                    print("Error processing detection:", e)
+                    ball_detected = False
+
+        if not ball_detected:
+            lost_counter += 1
+            if last_offset >= 0:
+                offset = last_offset + lost_counter * drift_rate
+            else:
+                offset = last_offset - lost_counter * drift_rate
+            pl.osd_img.draw_string(10, 110, "Ball Lost!", color=(255, 0, 0), scale=2)
+
+        # ---- 屏幕显示偏移量 ----
+        if offset < 0:
+            text_color = (255, 0, 0)
+        else:
+            text_color = (0, 255, 0)
+        text = "{:.1f}px".format(offset)
+
+        if ball_detected:
+            mid_x = (ball_cx + current_center_x) // 2
+            text_y = ball_cy + 15
+            last_mid_x = mid_x
+            last_text_y = text_y
+        else:
+            if 'last_mid_x' not in locals():
+                last_mid_x = current_center_x
+                last_text_y = center_y_display
+            mid_x = last_mid_x
+            text_y = last_text_y
+
+        try:
+            pl.osd_img.draw_string_advanced(mid_x - 60, text_y, text, color=text_color, font_size=32)
+        except Exception:
+            char_width = 30
+            text_width = len(text) * char_width
+            text_x = mid_x - text_width // 2
+            if text_x < 5:
+                text_x = 5
+            if text_x + text_width > display_size[0]:
+                text_x = display_size[0] - text_width - 5
+            if text_y < 5:
+                text_y = 5
+            if text_y + 40 > display_size[1]:
+                text_y = display_size[1] - 45
+            pl.osd_img.draw_string(text_x, text_y, text, color=text_color, scale=4)
+
+        # ---- 串口发送：整数字符串 ----
+        int_offset = int(offset + 0.5 if offset >= 0 else offset - 0.5)
+        uart.send(str(int_offset) + "\n")
+
+        # ---- 显示 ----
+        pl.show_image()
+        gc.collect()
+
+finally:
+    yolo.deinit()
+    pl.destroy()
+    uart.deinit()
